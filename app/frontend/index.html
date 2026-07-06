@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Todo App · MediShop</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <header class="card-header">
+      <span class="eyebrow">MediShop &middot; usage interne</span>
+      <h1>Tâches de l'équipe</h1>
+    </header>
+
+    <form id="todo-form" class="todo-form">
+      <input id="todo-input" type="text" placeholder="Ajouter une tâche..." autocomplete="off" required />
+      <button type="submit">Ajouter</button>
+    </form>
+
+    <ul id="todo-list" class="todo-list"></ul>
+    <p id="empty-state" class="empty-state">Aucune tâche pour l'instant — ajoutez-en une ci-dessus.</p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
