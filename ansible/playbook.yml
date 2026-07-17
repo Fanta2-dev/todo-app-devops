@@ -1,0 +1,12 @@
+---
+- name: Configurer toutes les machines (Docker)
+  hosts: app_servers
+  become: true
+  roles:
+    - docker
+
+- name: Configurer le Front (Nginx)
+  hosts: front
+  become: true
+  roles:
+    - nginx

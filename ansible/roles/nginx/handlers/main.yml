@@ -1,0 +1,5 @@
+---
+- name: Recharger nginx
+  service:
+    name: nginx
+    state: reloaded

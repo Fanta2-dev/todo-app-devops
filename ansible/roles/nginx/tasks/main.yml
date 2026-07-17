@@ -1,0 +1,32 @@
+---
+- name: Installer Nginx
+  apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: Deployer la config du reverse proxy
+  template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/sites-available/todo-app.conf
+    mode: "0644"
+  notify: Recharger nginx
+
+- name: Activer le site
+  file:
+    src: /etc/nginx/sites-available/todo-app.conf
+    dest: /etc/nginx/sites-enabled/todo-app.conf
+    state: link
+  notify: Recharger nginx
+
+- name: Desactiver le site par defaut
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Recharger nginx
+
+- name: Demarrer et activer Nginx
+  service:
+    name: nginx
+    state: started
+    enabled: true

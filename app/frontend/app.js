@@ -4,7 +4,7 @@
 // (port 3000) sont sur des ports différents, donc on doit préciser l'URL
 // complète. Change cette ligne selon le contexte, ou remets '/api' avant
 // de pousser sur GitHub / déployer.
-const API_BASE = 'http://localhost:3000/api';
+const API_BASE = '/api';
 // const API_BASE = '/api'; // <- à utiliser une fois derrière Nginx
 
 const form = document.getElementById('todo-form');
