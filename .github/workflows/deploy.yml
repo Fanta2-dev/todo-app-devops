@@ -1,0 +1,89 @@
+name: CI/CD Todo App
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      backend_changed: ${{ steps.filter.outputs.backend }}
+      frontend_changed: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Detecter les changements
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'app/backend/**'
+            frontend:
+              - 'app/frontend/**'
+
+      - name: Connexion Docker Hub
+        if: steps.filter.outputs.backend == 'true' || steps.filter.outputs.frontend == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build et push Backend
+        if: steps.filter.outputs.backend == 'true'
+        run: |
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/todo-backend:latest ./app/backend
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/todo-backend:latest
+
+      - name: Build et push Frontend
+        if: steps.filter.outputs.frontend == 'true'
+        run: |
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/todo-frontend:latest ./app/frontend
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/todo-frontend:latest
+
+  deploy-backend:
+    needs: build-and-push
+    if: needs.build-and-push.outputs.backend_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deployer le Back via le Front (ProxyJump)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key \
+            -o ProxyCommand="ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key -W %h:%p ubuntu@${{ secrets.FRONT_HOST }}" \
+            ubuntu@${{ secrets.BACK_HOST }} "
+              docker pull ${{ secrets.DOCKERHUB_USERNAME }}/todo-backend:latest &&
+              docker stop todo-backend || true &&
+              docker rm todo-backend || true &&
+              docker run -d --name todo-backend --restart always \
+                -p 3000:3000 \
+                -e DB_HOST=${{ secrets.DB_HOST }} \
+                -e DB_USER=${{ secrets.DB_USER }} \
+                -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+                -e DB_NAME=${{ secrets.DB_NAME }} \
+                -e DB_PORT=5432 \
+                ${{ secrets.DOCKERHUB_USERNAME }}/todo-backend:latest
+            "
+
+  deploy-frontend:
+    needs: build-and-push
+    if: needs.build-and-push.outputs.frontend_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deployer le Front
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@${{ secrets.FRONT_HOST }} "
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/todo-frontend:latest &&
+            docker stop todo-frontend || true &&
+            docker rm todo-frontend || true &&
+            docker run -d --name todo-frontend --restart always \
+              -p 8080:80 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/todo-frontend:latest
+          "
