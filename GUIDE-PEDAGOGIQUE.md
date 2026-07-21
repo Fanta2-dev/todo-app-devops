@@ -1,222 +1,213 @@
-# Guide pédagogique — TP DevOps : Todo App sur AWS
+# Guide pédagogique final — TP DevOps : Todo App MediShop sur AWS
 
-> Lis ce document dans l'ordre. Chaque partie répond à une question que ton prof (ou le jury) pourrait te poser : "pourquoi ce choix ?", "comment ça marche ?", "que se passe-t-il si..."
-
----
-
-## 0. Vue d'ensemble : les 3 piliers, en une phrase chacun
-
-- **Terraform (Infrastructure as Code)** = au lieu de cliquer dans la console AWS pour créer le VPC, les sous-réseaux, les EC2..., on **décrit** cette infrastructure dans des fichiers `.tf`, et Terraform la crée pour nous. Avantage : reproductible, versionné, on peut tout détruire et recréer à l'identique.
-- **Ansible (Configuration Management)** = une fois les machines créées, il faut les **configurer** (installer Docker, Nginx...). Ansible se connecte en SSH à chaque machine et exécute des instructions décrites dans un "playbook" YAML. Avantage : pas besoin de se connecter à la main sur chaque serveur.
-- **GitHub Actions (CI/CD)** = à chaque fois qu'on pousse du code sur `main`, un robot (le "workflow") construit automatiquement l'image Docker, la publie, et va la déployer sur le bon serveur. Avantage : plus jamais de "ça marche chez moi mais pas en prod".
-
-Retiens cette phrase pour ta soutenance : **"Terraform crée les machines, Ansible les configure, GitHub Actions déploie le code dessus."**
+> Version mise à jour après le déploiement réel complet. Ce document reflète ce qui a **vraiment fonctionné**, avec les vrais problèmes rencontrés et leurs solutions — exactement ce qu'il te faut pour la soutenance.
 
 ---
 
-## 1. Le choix des langages / technologies (et pourquoi)
+## 0. Vue d'ensemble : les 3 piliers
 
-C'est une question presque garantie à l'oral : "pourquoi avoir choisi ça ?"
+- **Terraform** crée l'infrastructure AWS (réseau, serveurs).
+- **Ansible** configure ces serveurs (installe Docker, Nginx).
+- **GitHub Actions** déploie automatiquement le code à chaque push.
 
-| Composant | Choix fait dans ce projet | Pourquoi ce choix pour un·e débutant·e |
+Phrase à retenir : **"Terraform crée les machines, Ansible les configure, GitHub Actions déploie le code dessus."**
+
+---
+
+## 1. Architecture finale réellement déployée
+
+```
+Internet
+   │
+   │ HTTP(S)
+   ▼
+┌─────────────────────────────────────────────┐
+│  VPC (10.0.0.0/16) — 2 zones de disponibilité │
+│                                                │
+│  Zone A (eu-west-3a)     Zone B (eu-west-3b)  │
+│  ┌──────────────────┐    ┌──────────────────┐ │
+│  │ Sous-réseau public│    │ Sous-réseau public│ │ (prêt, pas d'instance)
+│  │  - Front (Nginx +  │    │                  │ │
+│  │    conteneur front)│    └──────────────────┘ │
+│  │  - NAT Gateway     │                         │
+│  └──────────────────┘    ┌──────────────────┐ │
+│  ┌──────────────────┐    │ Sous-réseau privé │ │ (prêt, pas d'instance)
+│  │ Sous-réseau privé  │    └──────────────────┘ │
+│  │  - Back (API)      │                         │
+│  │  - DB (PostgreSQL) │                         │
+│  └──────────────────┘                          │
+└─────────────────────────────────────────────┘
+```
+
+### Pourquoi une instance NAT ?
+
+Ce n'était **pas prévu au départ**, mais on l'a découvert nécessaire en pratique : le Back et la DB, en sous-réseau privé, ne pouvaient pas faire `apt update` pour installer Docker, car ils n'avaient **aucune route vers Internet** (volontairement, pour la sécurité). La solution standard payante est un **NAT Gateway** managé par AWS, mais elle facture dès la première minute. On a utilisé à la place une **instance NAT** — une simple EC2 `t3.micro` (gratuite dans le tier gratuit) configurée pour relayer le trafic sortant du réseau privé vers Internet, sans jamais accepter de connexions entrantes depuis Internet.
+
+**Question d'oral probable** : *"Pourquoi Back/DB ont-ils quand même accès à Internet si vous vouliez les isoler ?"* → Réponse : accès **sortant uniquement** (pour les mises à jour et téléchargements), jamais **entrant** — Internet ne peut toujours pas initier de connexion vers eux. C'est exactement la distinction entre "isolé" et "invisible depuis Internet".
+
+---
+
+## 2. Pourquoi 2 zones de disponibilité, mais des instances sur une seule ?
+
+Consigne du prof (donnée oralement, illustrée par l'exemple Dakar/Thiès) : prévoir la haute disponibilité. Le réseau (sous-réseaux) est dupliqué sur 2 zones (`eu-west-3a` et `eu-west-3b`), **gratuitement** (les sous-réseaux ne coûtent rien).
+
+**Ce qui n'a volontairement pas été fait** : dupliquer les instances elles-mêmes. Une vraie haute disponibilité demanderait un Load Balancer (facturé dès la première minute) et poserait la question de la réplication de la base de données (RDS Multi-AZ, hors budget et hors scope "Docker sur EC2" du sujet).
+
+**Phrase à donner à l'oral** :
+> "J'ai conçu le réseau sur 2 zones de disponibilité pour préparer la haute disponibilité. Pour ce TP, avec un budget tier gratuit, je n'ai pas dupliqué les instances — ça demanderait un Load Balancer et un NAT Gateway managé, tous deux facturés dès la première minute d'usage. En conditions de production, l'étape suivante serait de dupliquer Front et Back derrière un Application Load Balancer, et migrer la DB vers RDS Multi-AZ."
+
+---
+
+## 3. Terraform : fichiers finaux
+
+```
+terraform/
+├── main.tf              → provider AWS
+├── variables.tf          → variables déclarées (region, instance_type, key_pair_name, admin_ip)
+├── terraform.tfvars       → tes valeurs réelles (jamais commité)
+├── vpc.tf                 → VPC + 4 sous-réseaux (2 zones × public/privé) + IGW + routage public
+├── security_groups.tf      → 3 Security Groups (front/back/db) + règle SSH GitHub Actions
+├── nat.tf                   → instance NAT + sa table de routage privée
+├── ec2.tf                    → 3 instances (front/back/db)
+└── outputs.tf                 → IPs affichées
+```
+
+### Pièges rencontrés et corrigés (bon matériel pour l'oral)
+
+| Piège | Cause | Correction |
 |---|---|---|
-| **Backend** | Node.js + Express (JavaScript) | Un seul langage (JS) pour front et back, énormément de documentation, très peu de code pour faire une API REST, démarre en une commande (`node server.js`). |
-| **Frontend** | HTML + CSS + JavaScript "vanilla" (pas de framework) | Pas de build (Webpack/Vite) à gérer dans Docker, pas de complexité React à expliquer en plus du DevOps. Le TP évalue le pipeline DevOps, pas la sophistication du front. C'est un choix assumé et défendable à l'oral : "j'ai volontairement simplifié le front pour me concentrer sur l'infra et le CI/CD". |
-| **Base de données** | PostgreSQL (image Docker officielle) | Relationnel, très répandu, image officielle bien maintenue, simple à lancer avec des variables d'environnement (`POSTGRES_PASSWORD`, etc.). |
-| **Reverse proxy** | Nginx (installé nativement sur l'hôte Front, pas en conteneur) | Le sujet demande "Nginx sur l'instance Front" comme point d'entrée fixe, avant même que les conteneurs démarrent — plus simple à administrer avec Certbot pour le HTTPS. |
+| `terraform plan` redemande les variables au clavier | Faute de casse : `Key_pair_name` au lieu de `key_pair_name` dans `terraform.tfvars` | Terraform est sensible à la casse — toujours vérifier l'orthographe exacte entre `variables.tf` et `terraform.tfvars` |
+| Erreur "Invalid security group description" | Apostrophes et accents interdits par AWS dans les champs `description` des Security Groups | Toutes les descriptions réécrites sans accents ni apostrophes |
+| `InvalidKeyPair.NotFound` | La paire de clés SSH avait été créée dans une région différente d'`eu-west-3` | Recréée directement avec `aws ec2 create-key-pair --region eu-west-3` |
+| `InstanceType not eligible for Free Tier` | `t2.micro` non éligible sur ce compte, contrairement à `t3.micro` | Vérifié avec `aws ec2 describe-instance-types --filters "Name=free-tier-eligible,Values=true"` avant de choisir |
+| `apt update` timeout sur Back/DB | Sous-réseau privé sans route vers Internet | Ajout d'une instance NAT (voir section 2) |
 
-> Tu peux tout à fait remplacer Node.js par Python/Flask ou React par un framework si tu es plus à l'aise — la logique DevOps (Docker, Terraform, Ansible, CI/CD) reste identique. L'important est de savoir **justifier** ton choix, pas de suivre celui-ci à la lettre.
+### Sécurité SSH : le compromis GitHub Actions
 
----
+Le Security Group du Front autorise le SSH depuis **2 sources** :
+1. `var.admin_ip` (ton IP précise, pour toi)
+2. `0.0.0.0/0` (pour que les runners GitHub Actions, dont l'IP change à chaque exécution, puissent se connecter)
 
-## 2. Comprendre l'architecture réseau AWS (avant de toucher à Terraform)
-
-Imagine le VPC comme un **quartier fermé** que tu construis dans AWS :
-
-- **VPC** = le quartier lui-même (un espace d'adresses IP privé, ex: `10.0.0.0/16`).
-- **Sous-réseau public** = la rue qui donne sur l'extérieur (Internet). La maison "Front" y habite : elle a une IP publique.
-- **Sous-réseau privé** = les rues intérieures, sans accès direct depuis l'extérieur. Les maisons "Back" et "DB" y habitent.
-- **Internet Gateway (IGW)** = la porte du quartier vers Internet. Seul le sous-réseau public y est raccordé (via une route dans sa table de routage).
-- **Security Group (SG)** = un vigile **par maison** qui vérifie qui a le droit d'entrer (et parfois de sortir). Chaque couche (Front/Back/DB) a son propre vigile avec ses propres règles.
-
-### Les règles de sécurité demandées, traduites en "qui peut parler à qui" :
-
-```
-Internet ──(HTTP 80, HTTPS 443)──▶ Front
-Toi (admin) ──(SSH 22, depuis TON ip uniquement)──▶ Front
-Front ──(port de l'API, ex: 3000)──▶ Back
-Back ──(port Postgres, 5432)──▶ DB
-```
-
-Et strictement rien d'autre. En particulier :
-- Le SG de **Back** n'autorise QUE le trafic venant du SG **Front** (pas d'Internet, pas de "0.0.0.0/0").
-- Le SG de **DB** n'autorise QUE le trafic venant du SG **Back**.
-
-C'est ce qu'on appelle le **principe du moindre privilège** : chaque couche n'ouvre que le strict nécessaire. C'est LA question de sécurité qu'on te posera à l'oral — sache l'expliquer avec ce schéma "qui parle à qui".
+**À dire honnêtement à l'oral** : ouvrir SSH à `0.0.0.0/0` est un vrai compromis de sécurité, pas une solution idéale. La solution propre en entreprise serait d'utiliser des runners GitHub self-hosted (dans le même VPC, IP fixe) ou un bastion/VPN — hors scope budgétaire de ce TP.
 
 ---
 
-## 3. Terraform, fichier par fichier
+## 4. Ansible : ce qui a vraiment posé problème
 
-Regarde le dossier `terraform/`. Voici ce que fait chaque fichier (tu dois pouvoir dérouler cette explication à l'oral) :
+### Ansible ne tourne pas nativement sous Windows
 
-- **`variables.tf`** : déclare toutes les valeurs qui peuvent changer (région AWS, CIDR du VPC, type d'instance, ton IP pour le SSH...). **Rien n'est écrit en dur** dans le code — c'est une exigence explicite du sujet ("variables externalisées").
-- **`terraform.tfvars`** (à créer toi-même, à partir de `terraform.tfvars.example`) : contient TES valeurs personnelles (ta clé SSH, ton IP...). Ce fichier ne doit **jamais** être poussé sur Git (il est dans `.gitignore`).
-- **`vpc.tf`** : crée le VPC, les 2 sous-réseaux (public/privé), l'Internet Gateway, la table de routage publique et son association.
-- **`security_groups.tf`** : crée les 3 Security Groups (front/back/db) avec les règles décrites plus haut — remarque que le SG "back" référence le SG "front" comme source autorisée (pas une IP en dur), c'est la bonne pratique.
-- **`ec2.tf`** : crée les 3 instances EC2 (Front en sous-réseau public avec IP publique, Back et DB en sous-réseau privé), en leur attachant le bon Security Group.
-- **`outputs.tf`** : affiche à la fin (`terraform output`) l'IP publique du Front, l'IP privée du Back, l'IP privée de la DB — comme demandé dans le sujet. Ansible ira lire ces sorties pour générer son inventaire.
+Erreur rencontrée : `AttributeError: module 'os' has no attribute 'get_blocking'`. Solution : installer **WSL** (Windows Subsystem for Linux) et faire tourner Ansible depuis un vrai environnement Linux à l'intérieur de Windows.
 
-### Comment on l'utilise (à connaître par cœur pour la démo) :
+### ProxyJump simple ne suffit pas — il faut ProxyCommand explicite
+
+`ansible_ssh_common_args='-o ProxyJump=...'` seul ne réutilise pas automatiquement la clé privée pour le saut intermédiaire (le Front). Solution retenue dans `inventory.ini` :
+
+```ini
+[back]
+back-01 ansible_host=10.0.2.32 ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/ma-cle-todo-devops.pem ansible_ssh_common_args='-o ProxyCommand="ssh -i ~/.ssh/ma-cle-todo-devops.pem -W %h:%p -o StrictHostKeyChecking=no ubuntu@<IP_FRONT>"'
+```
+
+**Point important** : l'IP publique du Front **change à chaque redémarrage** de l'instance (pas d'Elastic IP réservée). Il faut donc mettre à jour cette IP dans `inventory.ini` (3 occurrences) à chaque fois que les instances sont redémarrées.
+
+### known_hosts séparé entre Windows et WSL
+
+Accepter une empreinte SSH dans Git Bash (Windows) ne la fait pas connaître de WSL (Linux) — ce sont deux fichiers `known_hosts` distincts. Il faut faire une connexion SSH manuelle une fois **depuis WSL** vers chaque machine (front, back, db) avant qu'Ansible puisse s'y connecter sans bloquer.
+
+### Idempotence prouvée concrètement
+
+Deux exécutions consécutives du playbook : la première affiche `changed=X`, la seconde affiche `changed=0` partout — preuve tangible que le playbook ne casse rien en le rejouant. **Bon élément visuel à montrer en direct à l'oral.**
+
+---
+
+## 5. Docker : la leçon la plus importante — `--restart always`
+
+**Bug rencontré** : après un arrêt/redémarrage des instances EC2 (pour économiser le quota gratuit), tous les conteneurs Docker restaient éteints — ils ne redémarrent **pas automatiquement** avec la machine, sauf configuration explicite.
+
+**Solution** : toujours lancer les conteneurs avec l'option `--restart always` :
 
 ```bash
-cd terraform
-terraform init      # télécharge le "provider" AWS
-terraform plan       # montre ce qui VA être créé, sans rien créer encore
-terraform apply       # crée réellement l'infrastructure (demande confirmation "yes")
-terraform output      # affiche les IPs à la fin
-terraform destroy     # ⚠️ détruit tout (à faire en fin de TP pour ne pas payer/consommer le quota gratuit)
+docker run --name todo-db -e POSTGRES_USER=todo_user -e POSTGRES_PASSWORD=motdepasse123 -e POSTGRES_DB=todo_db -p 5432:5432 --restart always -d postgres:16-alpine
+
+docker run --name todo-backend -e DB_HOST=<IP_DB> -e DB_USER=todo_user -e DB_PASSWORD=motdepasse123 -e DB_NAME=todo_db -e DB_PORT=5432 -p 3000:3000 --restart always -d fantadev2/todo-backend:latest
+
+docker run --name todo-frontend -p 8080:80 --restart always -d fantadev2/todo-frontend:latest
 ```
 
-> **Piège classique à l'oral** : on te demandera "que se passe-t-il si tu relances `terraform apply` deux fois ?" Réponds : Terraform compare l'état désiré (le code) à l'état réel (stocké dans `terraform.tfstate`) et ne recrée QUE ce qui a changé. C'est ce qu'on appelle l'**idempotence** de Terraform.
+**Question d'oral probable** : *"Que se passe-t-il si l'EC2 redémarre ?"* → Avec `--restart always`, Docker relance automatiquement chaque conteneur au démarrage du service Docker — y compris en retentant plusieurs fois si une dépendance (comme la DB) n'est pas encore prête, ce qu'on a observé concrètement dans les logs du Back.
 
 ---
 
-## 4. Ansible, fichier par fichier
+## 6. Nginx : le bug du `proxy_pass` avec slash final
 
-Regarde le dossier `ansible/`.
+**Bug rencontré** : toutes les requêtes vers `/api/todos` renvoyaient une erreur 404 (page HTML d'Express, pas du JSON), alors que l'API fonctionnait très bien testée directement.
 
-- **`inventory.ini`** : la liste des machines à configurer, groupées par rôle (`[front]`, `[back]`, `[db]`), avec leur IP (récupérée depuis `terraform output`) et l'utilisateur SSH (`ubuntu` en général sur AWS).
-- **`playbook.yml`** : le fichier principal. Il dit "sur le groupe front, applique le rôle docker ET le rôle nginx ; sur back et db, applique juste le rôle docker".
-- **`roles/docker/tasks/main.yml`** : installe Docker et Docker Compose sur la machine, quel que soit son rôle.
-- **`roles/nginx/tasks/main.yml`** : installe Nginx, copie le fichier de configuration (le "fichier de config du domaine" demandé dans le sujet) depuis `roles/nginx/templates/`, redémarre Nginx.
-- **`roles/nginx/templates/nginx.conf.j2`** : le fichier de configuration Nginx, en template Jinja2 (Ansible peut y injecter des variables, comme l'IP du Back).
+**Cause** : dans la configuration Nginx, `proxy_pass http://IP:3000/;` (avec un `/` final) fait que Nginx **retire** le préfixe `/api/` avant de transmettre la requête au Back — qui reçoit donc `/todos` au lieu de `/api/todos`, une route qui n'existe pas.
 
-### Pourquoi c'est "idempotent" (exigence du sujet) ?
+**Correction** : retirer le `/` final :
+```nginx
+location /api/ {
+    proxy_pass http://10.0.2.32:3000;   # SANS slash final
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
 
-Ansible ne réinstalle pas Docker s'il est déjà installé — chaque module Ansible (`apt`, `service`, `copy`...) vérifie l'état actuel avant d'agir. Relancer le playbook 10 fois de suite ne casse rien : c'est la différence fondamentale avec un simple script bash.
+**Question d'oral probable** : *"Quelle est la différence entre `proxy_pass http://ip:port/` et `proxy_pass http://ip:port` ?"* → Avec le `/` final, Nginx réécrit l'URL en retirant le chemin du `location` ; sans le `/`, il transmet l'URL complète telle quelle. C'est un piège très courant et une excellente question à savoir expliquer.
 
-### Comment on l'utilise :
+---
 
+## 7. GitHub Actions : le piège du scope de token
+
+**Erreur rencontrée** : `refusing to allow a Personal Access Token to create or update workflow ... without workflow scope`.
+
+**Cause** : créer ou modifier un fichier dans `.github/workflows/` nécessite un token avec le scope **`workflow`** en plus du scope `repo` classique — une mesure de sécurité de GitHub pour empêcher qu'un token quelconque modifie silencieusement des pipelines d'automatisation.
+
+**Solution** : régénérer un token avec `repo` **et** `workflow` cochés, puis :
 ```bash
-cd ansible
-ansible-playbook -i inventory.ini playbook.yml
+git remote set-url origin https://TON_USER:NOUVEAU_TOKEN@github.com/TON_USER/TON_REPO.git
 ```
 
 ---
 
-## 5. L'application (Docker), fichier par fichier
+## 8. HTTPS gratuit sans nom de domaine : sslip.io
 
-Regarde `app/backend/` et `app/frontend/`.
+Pas de nom de domaine ? Solution 100% gratuite : **sslip.io**, un service DNS public qui transforme une IP en nom de domaine automatiquement, sans inscription :
 
-- **`app/backend/server.js`** : une petite API Express avec des routes `GET /api/todos`, `POST /api/todos`, `DELETE /api/todos/:id`, connectée à PostgreSQL via les variables d'environnement (`DB_HOST`, `DB_USER`, `DB_PASSWORD`...). **Aucun mot de passe n'est écrit dans le code** — exigence du sujet.
-- **`app/backend/Dockerfile`** : construit une image légère (`node:alpine`) contenant l'API.
-- **`app/frontend/index.html` / `app.js` / `style.css`** : une page simple qui appelle l'API (`fetch('/api/todos')`) pour afficher/ajouter/supprimer des tâches.
-- **`app/frontend/Dockerfile`** : sert les fichiers statiques via une image `nginx:alpine` (un mini serveur web dans le conteneur, à ne pas confondre avec le Nginx installé par Ansible sur l'hôte — celui-là fait le reverse proxy **devant** ce conteneur).
-- **DB** : pas de Dockerfile custom, on utilise directement l'image officielle `postgres:16-alpine` avec des variables d'environnement.
+```
+35-180-2-9.sslip.io  →  pointe automatiquement vers 35.180.2.9
+```
 
-### Pourquoi 2 "Nginx" différents ? (question piège fréquente)
-
-1. **Nginx "hôte"** (installé par Ansible sur la VM Front) = le reverse proxy public, avec Certbot pour le HTTPS. C'est LUI que voit Internet.
-2. **Nginx "conteneur"** (dans l'image frontend) = sert juste les fichiers HTML/CSS/JS statiques.
-
-Le Nginx hôte redirige `/` vers le conteneur frontend (port interne, ex: 8080) et `/api` vers le Back (IP privée : port 3000).
-
----
-
-## 6. Docker : builder, tagger, pousser
-
+Utilisable directement avec Certbot :
 ```bash
-docker build -t tonpseudo/todo-backend:latest ./app/backend
-docker push tonpseudo/todo-backend:latest
-
-docker build -t tonpseudo/todo-frontend:latest ./app/frontend
-docker push tonpseudo/todo-frontend:latest
+sudo certbot --nginx -d 35-180-2-9.sslip.io
 ```
 
-Crée un compte gratuit sur [Docker Hub](https://hub.docker.com) si tu n'en as pas. C'est ce registre que GitHub Actions utilisera automatiquement à chaque push.
+**Limite à connaître** : si l'IP publique du Front change (redémarrage sans Elastic IP), ce nom de domaine devient invalide — il faudrait relancer Certbot avec la nouvelle IP. En production, on réserverait une **Elastic IP** (gratuite tant qu'elle est attachée à une instance qui tourne) pour fixer l'IP définitivement.
 
 ---
 
-## 7. GitHub Actions, expliqué ligne par ligne
+## 9. Checklist de démonstration pour l'oral
 
-Regarde `.github/workflows/deploy.yml`. Le pipeline fait, dans l'ordre :
+Dans l'ordre, testé et validé :
 
-1. **`checkout`** : récupère le code du dépôt.
-2. **`docker/login-action`** : se connecte à Docker Hub avec des identifiants stockés dans **GitHub Secrets** (jamais en clair dans le fichier YAML — exigence du sujet).
-3. **`docker build` + `docker push`** : construit l'image Back (et/ou Front) et la publie.
-4. **`appleboy/ssh-action`** : se connecte en SSH à l'instance concernée (IP et clé privée stockées dans les Secrets) et exécute un script de déploiement.
-5. **Script de déploiement** : fait un `docker pull` de la nouvelle image, **arrête et supprime l'ancien conteneur s'il existe** (`docker stop ... || true` / `docker rm ... || true` — le `|| true` évite que le script échoue si le conteneur n'existait pas encore, exigence explicite du sujet pour le "premier déploiement"), puis relance un nouveau conteneur avec `docker run`.
+1. `terraform apply` → crée toute l'infra (ou montre l'infra déjà existante avec `terraform output`)
+2. `ansible-playbook -i inventory.ini playbook.yml` → relance-le une 2ᵉ fois en direct pour montrer `changed=0` (idempotence)
+3. Modifie un petit détail visuel dans `app/frontend/index.html`
+4. `git add . && git commit -m "..." && git push`
+5. Ouvre l'onglet **Actions** sur GitHub, montre le pipeline se dérouler en direct
+6. Rafraîchis `https://<ip-avec-tirets>.sslip.io` → montre le changement déployé automatiquement
+7. Montre le CRUD complet fonctionnel (Create/Read/Update/Delete)
+8. Explique les Security Groups (moindre privilège, `nc -zv` pour tester TCP vs `ping` qui échoue volontairement en ICMP)
 
-### Les secrets à créer dans GitHub (Settings → Secrets and variables → Actions) :
+## 10. Questions pièges et réponses courtes
 
-| Nom du secret | Contenu |
-|---|---|
-| `DOCKERHUB_USERNAME` | ton pseudo Docker Hub |
-| `DOCKERHUB_TOKEN` | un token d'accès Docker Hub (pas ton mot de passe) |
-| `BACK_HOST` | IP privée du Back (accessible car le runner GitHub passe par... voir note ci-dessous) |
-| `FRONT_HOST` | IP publique du Front |
-| `SSH_PRIVATE_KEY` | la clé privée qui correspond à la clé publique injectée dans les EC2 par Terraform |
-
-> **Note importante** : GitHub Actions tourne sur Internet, il ne peut pas atteindre directement une IP **privée** (Back/DB). La pratique la plus simple pour ce TP : le pipeline se connecte en SSH au **Front** (IP publique), puis, depuis le Front, rebondit en SSH vers le Back (`ssh -J` ou un double saut) pour le déployer — ou plus simple pour débuter : le pipeline copie le `docker-compose` du Back sur le Front, qui le relaie. Le plus simple et le plus souvent accepté en TP : configure un **saut SSH (ProxyJump)** via le Front. C'est un excellent point à mentionner à l'oral car ça montre que tu as compris la contrainte réseau (Back en sous-réseau privé = pas d'accès direct depuis Internet).
-
----
-
-## 8. Nginx + HTTPS (Let's Encrypt / Certbot)
-
-Une fois ton nom de domaine acheté (ou sous-domaine offert par un fournisseur) et pointé (enregistrement DNS de type **A**) vers l'IP publique du Front :
-
-```bash
-sudo apt update && sudo apt install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d ton-domaine.com
-```
-
-Certbot modifie automatiquement la configuration Nginx pour ajouter le certificat et rediriger le HTTP vers le HTTPS. Ansible peut aussi automatiser cette étape avec le module `command` (à condition que le DNS pointe déjà vers l'IP, sinon la validation Let's Encrypt échoue).
+- **"Pourquoi Back/DB ont accès à Internet si vous les isolez ?"** → Sortant uniquement (NAT), jamais entrant.
+- **"Pourquoi le ping échoue entre vos machines alors qu'elles communiquent ?"** → ICMP n'est pas autorisé dans les Security Groups, seul TCP sur les ports précis l'est.
+- **"Pourquoi 2 zones de disponibilité mais une seule utilisée par les instances ?"** → Réseau prêt pour la HA, instances non dupliquées par contrainte budgétaire (voir section 2).
+- **"Que se passe-t-il si le conteneur backend plante ?"** → `--restart always` le relance automatiquement, avec retry si une dépendance n'est pas encore prête.
+- **"Différence entre ProxyJump et ProxyCommand ?"** → ProxyJump est un raccourci pratique mais qui ne propage pas toujours explicitement la clé pour le saut intermédiaire ; ProxyCommand permet un contrôle complet et explicite de chaque étape de la connexion.
+- **"Pourquoi avoir ouvert SSH à 0.0.0.0/0 ?"** → Compromis assumé pour permettre à GitHub Actions (IP variable) de déployer ; en entreprise on utiliserait un runner self-hosted ou un bastion.
 
 ---
 
-## 9. Tester le déploiement de bout en bout (check-list avant la démo)
-
-1. `terraform apply` → note les IPs.
-2. Génère l'inventaire Ansible avec ces IPs (`ansible/inventory.ini`).
-3. `ansible-playbook -i ansible/inventory.ini ansible/playbook.yml` → Docker + Nginx installés partout.
-4. Lance manuellement les conteneurs une première fois (DB, puis Back, puis Front) pour vérifier que tout communique.
-5. Vérifie `curl http://IP_PUBLIQUE_FRONT` → doit renvoyer la page HTML.
-6. Vérifie `curl http://IP_PUBLIQUE_FRONT/api/todos` → doit renvoyer du JSON (via le reverse proxy vers le Back).
-7. Fais un petit changement de code, `git push` sur `main` → observe le workflow GitHub Actions se déclencher dans l'onglet "Actions" du dépôt → vérifie que le changement est visible sur le site.
-
-C'est exactement l'enchaînement qu'on te demandera de démontrer en live (point 5 des livrables).
-
----
-
-## 10. Préparer la soutenance orale (15 min)
-
-Structure suggérée :
-
-1. **Contexte & architecture** (2 min) : montre le schéma, explique le "qui parle à qui".
-2. **Terraform en live** (3 min) : montre `terraform plan`/`apply`, explique un extrait de `security_groups.tf`.
-3. **Ansible en live** (2 min) : lance le playbook, montre qu'il est idempotent (relance-le une 2e fois, montre que rien ne "change" — ligne verte "ok" au lieu de "changed").
-4. **CI/CD en live — LE moment fort** (5 min) : fais un petit changement visuel dans le frontend, `git push`, montre le workflow tourner dans GitHub Actions, puis rafraîchis le site pour montrer le changement déployé automatiquement.
-5. **Sécurité** (2 min) : explique les Security Groups et pourquoi Back/DB ne sont jamais exposés à Internet.
-6. **Questions** (1 min de marge).
-
-### Questions probables et réponses courtes à avoir en tête :
-
-- *"Pourquoi Terraform et pas la console AWS ?"* → reproductibilité, versionning, travail en équipe, rollback possible.
-- *"Pourquoi séparer Ansible de Terraform ?"* → Terraform gère l'infrastructure (le "quoi"), Ansible gère la configuration logicielle (le "comment"). Séparer les responsabilités = principe de base du DevOps.
-- *"Que se passe-t-il si le conteneur back plante ?"* → mentionne `restart: always` dans le `docker run`/compose, et le rollback prévu dans le pipeline.
-- *"Pourquoi la DB est en sous-réseau privé ?"* → surface d'attaque minimale, principe du moindre privilège.
-- *"Comment gères-tu les secrets ?"* → GitHub Secrets pour le CI/CD, variables d'environnement (jamais en dur) pour les conteneurs, `terraform.tfvars` jamais commité.
-
----
-
-## 11. Checklist finale des livrables
-
-- [ ] Code Terraform versionné sur Git (avec `.gitignore` pour `terraform.tfvars` et `*.tfstate`)
-- [ ] Playbooks Ansible fonctionnels et idempotents
-- [ ] Dockerfiles (Front, Back) + image DB officielle documentée
-- [ ] Workflow GitHub Actions qui build, push, et déploie automatiquement
-- [ ] Site accessible en HTTPS via un nom de domaine
-- [ ] Démo live prête (changement de code → push → mise à jour visible)
-
-Bon courage — tu as toutes les pièces du puzzle dans ce dossier, prends le temps de relire chaque fichier en te demandant "est-ce que je saurais l'expliquer avec mes mots ?" avant l'oral.
+Voilà, tu as un guide qui reflète exactement ton vrai parcours — avec les vraies embûches et les vraies solutions. Relis-le une fois avant l'oral, et surtout, entraîne-toi à raconter ces histoires de debug avec tes mots : c'est ce qui montre le mieux que tu as vraiment compris, pas juste suivi des instructions.
